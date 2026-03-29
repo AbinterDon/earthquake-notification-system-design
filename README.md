@@ -8,37 +8,116 @@ The goal is to demonstrate the core architectural trade-offs discussed in the le
 
 ## Architecture Overview
 
-```
-┌─────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   Client    │───▶│  API Gateway │───▶│ config-service  │──▶ PostgreSQL
-│  (mobile)   │    │              │    │ location-service│──▶ Redis
-└─────────────┘    └──────────────┘    └─────────────────┘
+### System Diagram
 
-                 External seismological
-                 data source (simulated)
-                        │
-                        ▼
-                  ┌───────────┐
-                  │  gateway  │──▶ stream:earthquakes (Redis Stream)
-                  └───────────┘
-                        │
-                        ▼
-            ┌─────────────────────┐
-            │  broadcast-service  │  geo-targeting orchestrator
-            │  (Orchestrator)     │──▶ Location DB (Redis)
-            └─────────────────────┘──▶ Config DB   (PostgreSQL)
-               │              │
-               ▼              ▼
-        stream:apns      stream:fcm       (Redis Streams)
-               │              │
-               ▼              ▼
-        ┌──────────┐   ┌──────────┐
-        │  worker  │   │  worker  │   stateless push senders
-        │  (APNs)  │   │  (FCM)   │
-        └──────────┘   └──────────┘
-               │              │
-               ▼              ▼
-          iOS devices    Android devices  (mocked — logs to stdout)
+```mermaid
+flowchart TD
+    MOB("📱 Mobile Client")
+    EXT("🌍 Seismological Feed\n― simulated ―")
+
+    subgraph user_apis["User APIs"]
+        CS["config-service\n:8081"]
+        LS["location-service\n:8082"]
+    end
+
+    subgraph datastores["Datastores"]
+        PG[("PostgreSQL\nuser_configs\nnotification_outbox")]
+        RD[("Redis\ngeo cell index\nsupersession cache")]
+    end
+
+    subgraph pipeline["Alert Pipeline"]
+        GW["gateway\n:8084"]
+        SEQ[["stream:earthquakes"]]
+        BS["broadcast-service\nGeo-targeting Orchestrator"]
+    end
+
+    subgraph fanout["Fan-out"]
+        SA[["stream:apns"]]
+        SF[["stream:fcm"]]
+        WA["worker-apns"]
+        WF["worker-fcm"]
+    end
+
+    subgraph vendors["Push Vendors (mocked)"]
+        APNS["APNs → iOS"]
+        FCM["FCM → Android"]
+    end
+
+    MOB -->|"POST /alerts/configuration"| CS
+    MOB -->|"POST /alerts/user_location"| LS
+    CS -->|"upsert config"| PG
+    LS -->|"update cell index"| RD
+
+    EXT --> GW
+    GW -->|"publish event"| SEQ
+    SEQ --> BS
+    BS <-->|"geo cell lookup"| RD
+    BS <-->|"batch config query"| PG
+    BS -->|"chunk jobs"| SA
+    BS -->|"chunk jobs"| SF
+    SA --> WA
+    SF --> WF
+    WA -->|"send"| APNS
+    WF -->|"send"| FCM
+```
+
+### Alert Broadcast Sequence
+
+```mermaid
+sequenceDiagram
+    participant GW as Gateway
+    participant SQ as stream:earthquakes
+    participant BS as Broadcast Service
+    participant RD as Redis
+    participant PG as PostgreSQL
+    participant CH as stream:apns / stream:fcm
+    participant WK as Worker
+
+    GW->>SQ: XADD event {alert_id, version, lat, lng, magnitude}
+    BS->>SQ: XREADGROUP (consumer group)
+    SQ-->>BS: earthquake event
+
+    BS->>RD: TrySetVersion (Lua CAS)
+    alt version outdated
+        RD-->>BS: rejected
+        BS-->>SQ: ACK (drop)
+    else version accepted
+        RD-->>BS: ok — update supersession cache
+
+        BS->>PG: CancelSuperseded (older versions → CANCELLED_SUPERSEDED)
+
+        BS->>RD: SMEMBERS geo:cell:{cells…}
+        RD-->>BS: candidate device tokens
+
+        BS->>PG: GetByTokens (batch config query)
+        PG-->>BS: magnitude + distance prefs per device
+
+        Note over BS: filter by distance & magnitude threshold
+
+        BS->>PG: INSERT notification_outbox (ENQUEUED)
+        BS->>CH: XADD notification job (chunked)
+        BS-->>SQ: ACK
+    end
+
+    WK->>CH: XREADGROUP
+    CH-->>WK: notification job
+
+    WK->>RD: GetVersion (supersession check)
+    alt job superseded
+        WK->>PG: UPDATE outbox → CANCELLED_SUPERSEDED
+    else job current
+        loop each device in chunk
+            WK->>PG: GetStatus (idempotency gate)
+            alt already terminal
+                Note over WK: skip
+            else
+                WK->>PG: UPDATE outbox → ATTEMPTED
+                WK->>WK: sendMock (APNs / FCM)
+                WK->>PG: UPDATE outbox → VENDOR_ACCEPTED / FAILED
+            end
+        end
+    end
+    WK-->>CH: ACK
 ```
 
 ### Services

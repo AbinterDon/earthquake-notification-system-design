@@ -1,0 +1,138 @@
+version: "3.9"
+
+# ── Shared environment ────────────────────────────────────────────────────────
+x-common-env: &common-env
+  DATABASE_URL: postgres://postgres:postgres@postgres:5432/earthquake?sslmode=disable
+  REDIS_ADDR: redis:6379
+  JWT_SECRET: dev-secret-change-in-production
+
+# ── Shared build context ──────────────────────────────────────────────────────
+x-build: &build
+  context: .
+  dockerfile: Dockerfile
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: earthquake
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no # memory-only for dev
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Application services ────────────────────────────────────────────────────
+
+  config-service:
+    build:
+      <<: *build
+      args:
+        SERVICE: config-service
+    environment:
+      <<: *common-env
+      ADDR: :8081
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  location-service:
+    build:
+      <<: *build
+      args:
+        SERVICE: location-service
+    environment:
+      <<: *common-env
+      ADDR: :8082
+    ports:
+      - "8082:8082"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+  gateway:
+    build:
+      <<: *build
+      args:
+        SERVICE: gateway
+    environment:
+      <<: *common-env
+      ADDR: :8084
+    ports:
+      - "8084:8084"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+  broadcast-service:
+    build:
+      <<: *build
+      args:
+        SERVICE: broadcast-service
+    environment:
+      <<: *common-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+  worker-apns:
+    build:
+      <<: *build
+      args:
+        SERVICE: worker
+    environment:
+      <<: *common-env
+      CHANNEL: apns
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+  worker-fcm:
+    build:
+      <<: *build
+      args:
+        SERVICE: worker
+    environment:
+      <<: *common-env
+      CHANNEL: fcm
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+volumes:
+  postgres_data:

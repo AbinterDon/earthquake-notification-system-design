@@ -1,0 +1,50 @@
+# Binaries
+/bin/
+*.exe
+
+# Go
+go.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Environment
+.env
+.env.*
+
+# Coverage
+coverage.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings (personal, not for sharing)
+.claude/
+
+# Design documents
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+.venv
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# SQLite database
+*.db
+*.sqlite3
+
+# Temp files
+extracted_text.txt

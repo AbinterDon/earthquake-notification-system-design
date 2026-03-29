@@ -150,22 +150,54 @@ geo:device:{token}:loc      → "lat,lng"  (raw coords, TTL = 30 days)
 
 ### 2. Two-tier queue decoupling (Redis Streams)
 
-```
-Event source ──▶ Gateway ──▶ [stream:earthquakes] ──▶ Broadcast Service
-                                                              │
-                                              ┌───────────────┴───────────────┐
-                                              ▼                               ▼
-                                     [stream:apns]                   [stream:fcm]
-                                              │                               │
-                                           Workers                         Workers
+```mermaid
+flowchart LR
+    EXT("🌍 Seismological\nFeed")
+
+    subgraph tier1["Tier 1 — Ingest"]
+        GW["Gateway\n:8084"]
+        SEQ[["stream:earthquakes\n― Redis Stream ―"]]
+    end
+
+    subgraph tier2["Tier 2 — Fan-out"]
+        BS["Broadcast Service\nOrchestrator"]
+        SA[["stream:apns\n― Redis Stream ―"]]
+        SF[["stream:fcm\n― Redis Stream ―"]]
+    end
+
+    subgraph workers["Workers (stateless, horizontally scalable)"]
+        WA1["worker-apns #1"]
+        WA2["worker-apns #2"]
+        WF1["worker-fcm #1"]
+        WF2["worker-fcm #2"]
+    end
+
+    APNS("APNs → iOS")
+    FCM("FCM → Android")
+
+    EXT --> GW
+    GW -->|"XADD"| SEQ
+    SEQ -->|"XREADGROUP\nconsumer group"| BS
+    BS -->|"XADD chunks"| SA
+    BS -->|"XADD chunks"| SF
+    SA -->|"XREADGROUP\napns-workers"| WA1
+    SA -->|"XREADGROUP\napns-workers"| WA2
+    SF -->|"XREADGROUP\nfcm-workers"| WF1
+    SF -->|"XREADGROUP\nfcm-workers"| WF2
+    WA1 --> APNS
+    WA2 --> APNS
+    WF1 --> FCM
+    WF2 --> FCM
 ```
 
 Two independent queue layers:
 
-- **Gateway → Broadcast Service:** decouples long-lived event-source connections from CPU-heavy geo-targeting. The gateway stays up even if the orchestrator restarts.
-- **Broadcast Service → Workers:** absorbs traffic spikes; each channel scales independently; an APNs outage does not affect FCM delivery.
+| Layer | Producer → Consumer | Why |
+|---|---|---|
+| **Tier 1** | Gateway → Broadcast Service | Decouples long-lived event-source connections from CPU-heavy geo-targeting. Gateway stays alive even if the orchestrator restarts. |
+| **Tier 2** | Broadcast Service → Workers | Absorbs traffic spikes. Each channel scales independently — an APNs outage only stalls `stream:apns`; FCM delivery continues unaffected. |
 
-Redis Streams are chosen over Kafka because they are memory-first (sub-millisecond enqueue) and require no external broker cluster.
+**Why Redis Streams over Kafka?** Redis is memory-first with sub-millisecond enqueue latency. Kafka is disk-first, optimised for high-throughput durable logs — not the low-latency fan-out this use case needs.
 
 ### 3. Supersession (out-of-order alert handling)
 
